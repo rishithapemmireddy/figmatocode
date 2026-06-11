@@ -1,12 +1,21 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { FigmaPreview } from "./components/FigmaPreview";
-import { CodeFormat, collectFrames, generateCodeForFrame, FigmaFile } from "./utils/figmaToCode";
+import { CodeFormat, collectPages, createPageLevelJson, generateCodeForPage, FigmaFile } from "./utils/figmaToCode";
 
 const EXAMPLE_FILE_KEY = "8VV8hCa7NJjw68b6dykdXN";
 const DEFAULT_GEMINI_KEY = import.meta.env.VITE_GEMINI_KEY || "";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type TabType = "compiler" | "ai";
+const FIGMA_RETRY_LIMIT = 2;
+
+type AssetExtractionResponse = {
+  figmaJson?: FigmaFile;
+  assets?: Array<{ imageRef: string; path: string }>;
+  imageRefCount?: number;
+  missingRefs?: string[];
+  error?: string;
+};
 
 export function App() {
   // Step 1 State: Extraction from API (Do not touch)
@@ -21,8 +30,9 @@ export function App() {
   const [figmaJson, setFigmaJson] = useState<FigmaFile | null>(null);
   const [fileName, setFileName] = useState("");
   const [format, setFormat] = useState<CodeFormat>("html");
-  const [activeFrameId, setActiveFrameId] = useState("");
+  const [activePageId, setActivePageId] = useState("");
   const [jsonError, setJsonError] = useState<string | null>(null);
+  const [imageAssetMessage, setImageAssetMessage] = useState("");
 
   // Code Inspector & AI states
   const [activeTab, setActiveTab] = useState<TabType>("compiler");
@@ -32,32 +42,36 @@ export function App() {
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
 
-  // Collect frames from the active Figma JSON
-  const frames = useMemo(() => {
-    return figmaJson ? collectFrames(figmaJson.document) : [];
+  // Collect full Figma pages from the active Figma JSON
+  const pages = useMemo(() => {
+    return figmaJson ? collectPages(figmaJson.document) : [];
   }, [figmaJson]);
 
-  // Find the active frame
-  const activeFrame = useMemo(() => {
-    if (!frames.length) return null;
-    return frames.find((f) => f.id === activeFrameId) || frames[0];
-  }, [frames, activeFrameId]);
+  // Find the active page
+  const activePage = useMemo(() => {
+    if (!pages.length) return null;
+    return pages.find((page) => page.id === activePageId) || pages[0];
+  }, [pages, activePageId]);
+
+  const detectedPagesDebugJson = useMemo(() => {
+    return JSON.stringify(pages.map(createPageLevelJson), null, 2);
+  }, [pages]);
 
   // Clear AI code cache when format or filename changes to ensure consistent generation
   useEffect(() => {
     setAiCodeCache({});
   }, [format, fileName]);
 
-  // Generate standard compiler code on frame/format/name change
+  // Generate standard compiler code on page/format/name change
   useEffect(() => {
-    if (!activeFrame) {
+    if (!activePage) {
       setCompilerCode("");
       return;
     }
     try {
-      const code = generateCodeForFrame(activeFrame, {
+      const code = generateCodeForPage(activePage, {
         format,
-        componentName: fileName || activeFrame.name || "FigmaExport"
+        componentName: fileName || activePage.name || "FigmaExport"
       });
       setCompilerCode(code);
       setJsonError(null);
@@ -65,41 +79,34 @@ export function App() {
       setJsonError(error instanceof Error ? error.message : "Error compiling standard code");
       setCompilerCode("");
     }
-  }, [activeFrame, format, fileName]);
+  }, [activePage, format, fileName]);
 
   // Automatically trigger AI generation if user selects AI tab and cache is empty
   useEffect(() => {
-    if (activeTab === "ai" && activeFrame && !aiCodeCache[activeFrame.id] && !isAiLoading) {
-      generateCodeWithGemini(activeFrame);
+    if (activeTab === "ai" && activePage && !aiCodeCache[activePage.id] && !isAiLoading) {
+      generateCodeWithGemini(activePage);
     }
-  }, [activeTab, activeFrame, aiCodeCache]);
+  }, [activeTab, activePage, aiCodeCache]);
 
   // Handle Step 1 API fetch (Do not touch)
   async function handleExtractSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setStep1Status("loading");
     setStep1Message("Fetching from Figma API...");
+    setExtractedRawJson("");
 
     try {
-      const cleanKey = fileKey.trim();
+      const cleanKey = normalizeFigmaFileKey(fileKey);
       const cleanToken = figmaToken.trim();
 
       if (!cleanKey) {
-        throw new Error("Enter a Figma file key");
+        throw new Error("Enter a valid Figma file key or file URL");
       }
       if (!cleanToken) {
         throw new Error("Enter a Figma Personal Access Token");
       }
 
-      const response = await fetch(`/figma-api/v1/files/${cleanKey}`, {
-        headers: {
-          "X-Figma-Token": cleanToken
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`Figma API returned error: ${response.status} ${response.statusText}`);
-      }
+      const response = await fetchFigmaFileWithRetry(cleanKey, cleanToken);
 
       const data = await response.json();
       const stringified = JSON.stringify(data, null, 2);
@@ -112,42 +119,176 @@ export function App() {
     }
   }
 
+  async function fetchFigmaFileWithRetry(cleanKey: string, cleanToken: string) {
+    let lastResponse: Response | null = null;
+
+    for (let attempt = 0; attempt <= FIGMA_RETRY_LIMIT; attempt += 1) {
+      const response = await fetch(`/figma-api/v1/files/${encodeURIComponent(cleanKey)}`, {
+        method: "GET",
+        cache: "no-store",
+        headers: {
+          "X-Figma-Token": cleanToken,
+          "Cache-Control": "no-cache",
+          "Pragma": "no-cache"
+        }
+      });
+
+      if (response.ok) return response;
+      lastResponse = response;
+
+      if (response.status !== 429 || attempt === FIGMA_RETRY_LIMIT) {
+        break;
+      }
+
+      const retryAfterSeconds = Number(response.headers.get("Retry-After"));
+      const delayMs = Number.isFinite(retryAfterSeconds)
+        ? retryAfterSeconds * 1000
+        : 1200 * (attempt + 1);
+
+      setStep1Message(`Figma rate limit hit. Retrying in ${Math.ceil(delayMs / 1000)}s...`);
+      await delay(delayMs);
+    }
+
+    if (!lastResponse) {
+      throw new Error("Unable to reach Figma API");
+    }
+
+    throw await createFigmaApiError(lastResponse);
+  }
+
+  async function createFigmaApiError(response: Response) {
+    const retryAfter = response.headers.get("Retry-After");
+    const detail = await readFigmaErrorBody(response);
+    const retryText = response.status === 429 && retryAfter ? ` Try again after ${retryAfter}s.` : "";
+
+    return new Error(`Figma API returned ${response.status} ${response.statusText}.${retryText}${detail ? ` ${detail}` : ""}`);
+  }
+
+  async function readFigmaErrorBody(response: Response) {
+    try {
+      const text = await response.text();
+      if (!text) return "";
+
+      try {
+        const parsed = JSON.parse(text);
+        return parsed?.err || parsed?.message || text.slice(0, 240);
+      } catch {
+        return text.slice(0, 240);
+      }
+    } catch {
+      return "";
+    }
+  }
+
+  function normalizeFigmaFileKey(value: string) {
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+
+    const fileMatch = trimmed.match(/figma\.com\/(?:file|design)\/([a-zA-Z0-9]+)/);
+    if (fileMatch?.[1]) return fileMatch[1];
+
+    return trimmed.replace(/^\/+|\/+$/g, "");
+  }
+
+  function delay(ms: number) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
   // Handle Step 2 pasted JSON
-  function handlePastedJsonChange(value: string) {
+  async function handlePastedJsonChange(value: string) {
     setPastedJson(value);
     if (!value.trim()) {
       setFigmaJson(null);
       setCompilerCode("");
-      setActiveFrameId("");
+      setActivePageId("");
       setAiCodeCache({});
       setJsonError(null);
+      setImageAssetMessage("");
       return;
     }
 
     try {
       const parsed = JSON.parse(value) as FigmaFile;
-      setFigmaJson(parsed);
+      const processed = await extractImageAssetsForFigmaJson(parsed);
+
+      setFigmaJson(processed);
       setJsonError(null);
       if (parsed.name && !fileName) {
         setFileName(parsed.name);
       }
 
-      const foundFrames = collectFrames(parsed.document);
-      if (foundFrames.length > 0) {
-        setActiveFrameId(foundFrames[0].id);
+      const foundPages = collectPages(processed.document);
+      if (foundPages.length > 0) {
+        setActivePageId(foundPages[0].id);
       }
     } catch (err) {
       setFigmaJson(null);
       setCompilerCode("");
-      setActiveFrameId("");
+      setActivePageId("");
       setAiCodeCache({});
+      setImageAssetMessage("");
       setJsonError("Invalid JSON: Please check the syntax structure.");
     }
   }
 
+  async function extractImageAssetsForFigmaJson(parsed: FigmaFile) {
+    const cleanKey = normalizeFigmaFileKey(fileKey);
+    const cleanToken = figmaToken.trim();
+
+    if (!cleanKey || !cleanToken) {
+      setImageAssetMessage("Image extraction skipped: enter Figma file key and token in Step 1.");
+      return parsed;
+    }
+
+    setImageAssetMessage("Checking Figma image fills...");
+
+    try {
+      const response = await fetch("/figma-assets/extract", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          fileKey: cleanKey,
+          token: cleanToken,
+          figmaJson: parsed
+        })
+      });
+
+      const data = (await response.json()) as AssetExtractionResponse;
+
+      if (!response.ok || !data.figmaJson) {
+        throw new Error(data.error || `Image extraction failed: ${response.status}`);
+      }
+
+      const count = data.assets?.length ?? 0;
+      const imageRefCount = data.imageRefCount ?? 0;
+      const missingCount = data.missingRefs?.length ?? 0;
+
+      if (count > 0) {
+        setImageAssetMessage(`Downloaded ${count}/${imageRefCount} Figma image asset${count === 1 ? "" : "s"}.`);
+      } else if (imageRefCount > 0) {
+        setImageAssetMessage(
+          `Found ${imageRefCount} image refs, but Figma returned no downloadable URLs. Check that Step 1 uses the same file key and a token with access, and that Figma is not rate-limited.`
+        );
+      } else {
+        setImageAssetMessage("No Figma image fills found.");
+      }
+
+      if (missingCount > 0 && count > 0) {
+        setImageAssetMessage(`Downloaded ${count}/${imageRefCount} Figma image assets. ${missingCount} refs had no downloadable URL.`);
+      }
+
+      return data.figmaJson;
+    } catch (error) {
+      setImageAssetMessage(error instanceof Error ? error.message : "Unable to extract image assets.");
+      return parsed;
+    }
+  }
+
   // Gemini AI code refiner fetch
-  async function generateCodeWithGemini(frameNode: any) {
-    if (!frameNode) return;
+  async function generateCodeWithGemini(pageNode: any) {
+    if (!pageNode) return;
     setIsAiLoading(true);
     setAiError(null);
 
@@ -160,15 +301,20 @@ export function App() {
 
     const formatLabel = format === "html" 
       ? "HTML + CSS (a complete index.html unified page with absolute/relative standard CSS inside a <style> tag)" 
+      : format === "flutter"
+      ? "Flutter Widget (a Dart class extending StatelessWidget with Material Design components)"
       : "React TypeScript Component (a clean .tsx functional component file utilizing inline styles or semantic Tailwind CSS)";
+    const pageLevelJson = createPageLevelJson(pageNode);
 
-    const promptText = `You are an expert frontend developer. Convert the following Figma JSON node (representing a single frame) into highly polished, clean, modern ${formatLabel} code.
-Use modern CSS layouts (Flexbox, Grid, absolute positioning where appropriate) to match the layout and design of the frame.
+    const promptText = `You are an expert frontend developer. Convert the following cleaned Figma JSON node (representing one complete UI screen) into highly polished, clean, modern ${formatLabel} code.
+This node was detected using only first-level FRAME children inside a Figma CANVAS. Nested frames inside it are components/sections, not separate pages.
+When an IMAGE fill contains a src field like "/assets/name.png", render the actual image using an <img> tag or CSS background-image. Do not replace image assets with placeholders.
+Use modern CSS layouts (Flexbox, Grid, absolute positioning where appropriate) to match the layout and design of the full screen.
 Ensure the design is responsive, semantic, visually stunning, matches the proportions/colors, and follows standard design conventions.
 Only output the raw code block inside a Markdown block. Do not include extra conversational explanations.
 
-Figma Node JSON:
-${JSON.stringify(frameNode, null, 2)}`;
+Cleaned Figma Screen JSON:
+${JSON.stringify(pageLevelJson, null, 2)}`;
 
     try {
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`, {
@@ -205,7 +351,7 @@ ${JSON.stringify(frameNode, null, 2)}`;
       const cleanedCode = cleanMarkdownCode(rawText);
       setAiCodeCache((prev) => ({
         ...prev,
-        [frameNode.id]: cleanedCode
+        [pageNode.id]: cleanedCode
       }));
     } catch (err) {
       setAiError(err instanceof Error ? err.message : "Error contacting Gemini API");
@@ -241,10 +387,10 @@ ${JSON.stringify(frameNode, null, 2)}`;
   }
 
   function handleDownloadCode() {
-    const codeToDownload = activeTab === "compiler" ? compilerCode : aiCodeCache[activeFrameId] || "";
+    const codeToDownload = activeTab === "compiler" ? compilerCode : aiCodeCache[activePageId] || "";
     if (!codeToDownload) return;
     
-    const ext = format === "html" ? "html" : "tsx";
+    const ext = format === "html" ? "html" : format === "flutter" ? "dart" : "tsx";
     const prefix = activeTab === "compiler" ? "compiler_" : "ai_";
     downloadFile(codeToDownload, `${prefix}${fileName || "FigmaExport"}.${ext}`, "text/plain");
   }
@@ -265,7 +411,7 @@ ${JSON.stringify(frameNode, null, 2)}`;
   }
 
   // Determine current active code displayed
-  const currentDisplayCode = activeTab === "compiler" ? compilerCode : aiCodeCache[activeFrameId] || "";
+  const currentDisplayCode = activeTab === "compiler" ? compilerCode : aiCodeCache[activePageId] || "";
 
   return (
     <main className="min-h-screen bg-[#110f12] font-poppins text-gray-200">
@@ -376,7 +522,7 @@ ${JSON.stringify(frameNode, null, 2)}`;
           <div className="mb-4 flex items-center justify-between border-b border-white/5 pb-3">
             <div className="flex items-center gap-2">
               <span className="flex h-5 w-5 items-center justify-center rounded-full bg-[#0ACF83] text-[10px] font-bold text-white">2</span>
-              <h2 className="text-xs font-bold uppercase tracking-wider text-white">Paste Figma JSON & Generate Code (Frame by Frame)</h2>
+              <h2 className="text-xs font-bold uppercase tracking-wider text-white">Paste Figma JSON & Generate Code (Page by Page)</h2>
             </div>
             {jsonError && (
               <span className="text-[10px] bg-red-500/10 border border-red-500/20 text-red-400 px-2 py-0.5 rounded font-medium">
@@ -403,64 +549,86 @@ ${JSON.stringify(frameNode, null, 2)}`;
               </div>
 
               {figmaJson && (
-                <div className="grid grid-cols-3 gap-3">
+                <>
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">Component Name</label>
+                      <input
+                        type="text"
+                        value={fileName}
+                        onChange={(event) => setFileName(event.target.value)}
+                        placeholder="FigmaExport"
+                        className="h-9 rounded-lg border border-white/10 bg-[#221e24] px-3 text-xs text-white outline-none focus:border-[#0ACF83]"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">Format</label>
+                      <select
+                        value={format}
+                        onChange={(event) => setFormat(event.target.value as CodeFormat)}
+                        className="h-9 rounded-lg border border-white/10 bg-[#221e24] px-2 text-xs text-white outline-none cursor-pointer focus:border-[#0ACF83]"
+                      >
+                        <option value="html">HTML + CSS</option>
+                        <option value="react">React Component</option>
+                        <option value="flutter">Flutter Widget</option>
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">Gemini Key</label>
+                      <input
+                        type="password"
+                        value={geminiApiKey}
+                        onChange={(event) => setGeminiApiKey(event.target.value)}
+                        placeholder="AI API Key..."
+                        className="h-9 rounded-lg border border-white/10 bg-[#221e24] px-3 text-xs text-white outline-none focus:border-[#0ACF83]"
+                      />
+                    </div>
+                  </div>
+
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">Component Name</label>
-                    <input
-                      type="text"
-                      value={fileName}
-                      onChange={(event) => setFileName(event.target.value)}
-                      placeholder="FigmaExport"
-                      className="h-9 rounded-lg border border-white/10 bg-[#221e24] px-3 text-xs text-white outline-none focus:border-[#0ACF83]"
+                    <div className="flex items-center justify-between">
+                      <label className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">Detected Pages JSON</label>
+                      <span className="rounded bg-[#0ACF83]/10 px-2 py-0.5 text-[9px] font-semibold text-[#0ACF83]">
+                        CANVAS direct FRAME only
+                      </span>
+                    </div>
+                    <textarea
+                      readOnly
+                      value={detectedPagesDebugJson}
+                      className="h-36 w-full resize-none rounded-lg border border-white/10 bg-[#110f12] p-3 font-mono text-[10px] text-gray-300 outline-none"
                     />
+                    {imageAssetMessage && (
+                      <p className="text-[10px] text-gray-400">
+                        {imageAssetMessage}
+                      </p>
+                    )}
                   </div>
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">Format</label>
-                    <select
-                      value={format}
-                      onChange={(event) => setFormat(event.target.value as CodeFormat)}
-                      className="h-9 rounded-lg border border-white/10 bg-[#221e24] px-2 text-xs text-white outline-none cursor-pointer focus:border-[#0ACF83]"
-                    >
-                      <option value="html">HTML + CSS</option>
-                      <option value="react">React Component</option>
-                    </select>
-                  </div>
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">Gemini Key</label>
-                    <input
-                      type="password"
-                      value={geminiApiKey}
-                      onChange={(event) => setGeminiApiKey(event.target.value)}
-                      placeholder="AI API Key..."
-                      className="h-9 rounded-lg border border-white/10 bg-[#221e24] px-3 text-xs text-white outline-none focus:border-[#0ACF83]"
-                    />
-                  </div>
-                </div>
+                </>
               )}
             </div>
 
-            {/* Workspace Dashboard: Frames Sidebar, Preview Panel, Code Output */}
+            {/* Workspace Dashboard: Pages Sidebar, Preview Panel, Code Output */}
             <div className="lg:col-span-3 grid gap-4 md:grid-cols-[140px_1fr_1fr]">
               
-              {/* Sidebar (Frames) */}
+              {/* Sidebar (Pages) */}
               <aside className="rounded-lg border border-white/5 bg-[#110f12] p-3 flex flex-col gap-2">
-                <span className="text-[9px] font-bold uppercase tracking-wider text-gray-400">Detected Frames</span>
+                <span className="text-[9px] font-bold uppercase tracking-wider text-gray-400">Detected Pages</span>
                 <div className="flex flex-col gap-1 overflow-y-auto max-h-[440px] pr-1">
-                  {frames.map((frame) => (
+                  {pages.map((page) => (
                     <button
-                      key={frame.id}
+                      key={page.id}
                       type="button"
-                      onClick={() => setActiveFrameId(frame.id)}
+                      onClick={() => setActivePageId(page.id)}
                       className={`truncate w-full rounded-md px-2 py-1.5 text-left text-[11px] transition-all ${
-                        frame.id === activeFrame?.id
+                        page.id === activePage?.id
                           ? "bg-[#0ACF83] text-white font-semibold"
                           : "text-gray-400 hover:bg-white/5 hover:text-white"
                       }`}
                     >
-                      {frame.name}
+                      {page.name}
                     </button>
                   ))}
-                  {frames.length === 0 && (
+                  {pages.length === 0 && (
                     <div className="text-[10px] text-gray-500 italic text-center py-6">
                       No JSON loaded.
                     </div>
@@ -476,7 +644,7 @@ ${JSON.stringify(frameNode, null, 2)}`;
                   backgroundSize: '12px 12px'
                 }}>
                   {figmaJson ? (
-                    <FigmaPreview activeFrame={activeFrame} />
+                    <FigmaPreview activePage={activePage} />
                   ) : (
                     <div className="text-center p-4">
                       <p className="text-[10px] text-gray-500">Waiting for Figma JSON data...</p>
@@ -554,18 +722,18 @@ ${JSON.stringify(frameNode, null, 2)}`;
                       <p className="mb-3 text-[10px] text-red-400">{aiError}</p>
                       <button
                         type="button"
-                        onClick={() => generateCodeWithGemini(activeFrame)}
+                        onClick={() => generateCodeWithGemini(activePage)}
                         className="rounded bg-[#A259FF] px-2.5 py-1 text-[9px] font-bold text-white hover:bg-[#8e46eb]"
                       >
                         Retry Generation
                       </button>
                     </div>
-                  ) : activeTab === "ai" && figmaJson && !aiCodeCache[activeFrameId] ? (
+                  ) : activeTab === "ai" && figmaJson && !aiCodeCache[activePageId] ? (
                     <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#171418] p-4 text-center">
                       <p className="mb-3 text-[10px] text-gray-500">Gemini AI code not generated yet.</p>
                       <button
                         type="button"
-                        onClick={() => generateCodeWithGemini(activeFrame)}
+                        onClick={() => generateCodeWithGemini(activePage)}
                         className="rounded bg-[#A259FF] px-3 py-1.5 text-[9px] font-bold text-white hover:bg-[#8e46eb]"
                       >
                         Generate Code with Gemini AI
@@ -574,7 +742,7 @@ ${JSON.stringify(frameNode, null, 2)}`;
                   ) : (
                     <textarea
                       readOnly
-                      value={currentDisplayCode || (figmaJson ? "Select a frame and click Generate to see code." : "Generated code will display here once valid JSON is pasted.")}
+                      value={currentDisplayCode || (figmaJson ? "Select a page and click Generate to see code." : "Generated code will display here once valid JSON is pasted.")}
                       className={`h-full w-full resize-none bg-transparent p-3 outline-none leading-normal ${
                         activeTab === "compiler" ? "text-[#0ACF83]" : "text-[#A259FF]"
                       }`}

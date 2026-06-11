@@ -1,5 +1,7 @@
 export type FigmaPaint = {
   type?: string;
+  imageRef?: string;
+  src?: string;
   color?: {
     r: number;
     g: number;
@@ -39,7 +41,12 @@ export type FigmaFile = {
   document?: FigmaNode;
 };
 
-export type CodeFormat = "html" | "react";
+export type DetectedPageJson = Omit<FigmaNode, "type"> & {
+  type: "SCREEN";
+  sourceType: string;
+};
+
+export type CodeFormat = "html" | "react" | "flutter";
 
 interface GenerateOptions {
   format: CodeFormat;
@@ -47,32 +54,106 @@ interface GenerateOptions {
 }
 
 export function generateCodeFromFigmaJson(file: FigmaFile, options: GenerateOptions) {
-  const frames = collectFrames(file.document).slice(0, 3);
-  const roots = frames.length > 0 ? frames : file.document?.children?.slice(0, 1) ?? [];
+  const pages = collectPages(file.document);
+  const roots = pages.length > 0 ? [getRenderablePageNode(pages[0])] : file.document?.children?.slice(0, 1) ?? [];
   const title = file.name || "FigmaExport";
 
   if (options.format === "react") {
     return generateReact(roots, toComponentName(options.componentName || title));
   }
 
-  return generateHtmlCss(roots, title);
-}
-
-export function generateCodeForFrame(node: FigmaNode, options: GenerateOptions) {
-  const title = node.name || "FigmaExport";
-  const roots = [node];
-
-  if (options.format === "react") {
-    return generateReact(roots, toComponentName(options.componentName || title));
+  if (options.format === "flutter") {
+    return generateFlutter(roots, toComponentName(options.componentName || title));
   }
 
   return generateHtmlCss(roots, title);
 }
 
-export function collectFrames(node?: FigmaNode): FigmaNode[] {
+export function generateCodeForPage(node: FigmaNode, options: GenerateOptions) {
+  const title = node.name || "FigmaExport";
+  const roots = [getRenderablePageNode(node)];
+
+  if (options.format === "react") {
+    return generateReact(roots, toComponentName(options.componentName || title));
+  }
+
+  if (options.format === "flutter") {
+    return generateFlutter(roots, toComponentName(options.componentName || title));
+  }
+
+  return generateHtmlCss(roots, title);
+}
+
+export function collectPages(node?: FigmaNode): FigmaNode[] {
   if (!node) return [];
-  const matches = ["FRAME", "COMPONENT", "INSTANCE", "SECTION"].includes(node.type) ? [node] : [];
-  return [...matches, ...(node.children ?? []).flatMap(collectFrames)];
+
+  if (node.type === "DOCUMENT") {
+    return (node.children ?? []).filter((child) => child.type === "CANVAS").flatMap(collectPages);
+  }
+
+  if (node.type === "CANVAS") {
+    return (node.children ?? []).filter((child) => child.type === "FRAME");
+  }
+
+  return node.type === "FRAME" ? [node] : [];
+}
+
+export function getPageRenderRoots(page: FigmaNode): FigmaNode[] {
+  if (hasRenderableBox(page)) return [page];
+
+  const directRenderableChildren = (page.children ?? []).filter(hasRenderableBox);
+  if (directRenderableChildren.length > 0) return directRenderableChildren;
+
+  return page.children ?? [page];
+}
+
+export function getRenderablePageNode(page: FigmaNode): FigmaNode {
+  if (hasRenderableBox(page)) return page;
+
+  const roots = getPageRenderRoots(page);
+  const bounds = getCombinedBounds(roots);
+
+  return {
+    id: page.id,
+    name: page.name,
+    type: page.type,
+    children: roots,
+    absoluteBoundingBox: {
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height
+    },
+    fills: page.fills
+  };
+}
+
+export function createPageLevelJson(page: FigmaNode): DetectedPageJson {
+  return {
+    ...page,
+    type: "SCREEN",
+    sourceType: page.type,
+    children: page.children ?? []
+  };
+}
+
+export function getCombinedBounds(nodes: FigmaNode[]) {
+  const boxes = nodes
+    .map((node) => node.absoluteBoundingBox)
+    .filter((box): box is NonNullable<FigmaNode["absoluteBoundingBox"]> => Boolean(box));
+  if (!boxes.length) return { x: 0, y: 0, width: 360, height: 640 };
+
+  const minX = Math.min(...boxes.map((box) => box.x));
+  const minY = Math.min(...boxes.map((box) => box.y));
+  const maxX = Math.max(...boxes.map((box) => box.x + box.width));
+  const maxY = Math.max(...boxes.map((box) => box.y + box.height));
+
+  return {
+    x: minX,
+    y: minY,
+    width: Math.max(1, maxX - minX),
+    height: Math.max(1, maxY - minY)
+  };
 }
 
 function generateHtmlCss(roots: FigmaNode[], title: string) {
@@ -125,6 +206,134 @@ ${indent(jsx, 6)}
     </main>
   );
 }`;
+}
+
+function generateFlutter(roots: FigmaNode[], componentName: string) {
+  const dart = roots.map((node, index) => renderFlutterNode(node, undefined, `screen${index + 1}`)).join("\n");
+
+  return `import 'package:flutter/material.dart';
+
+class ${componentName} extends StatelessWidget {
+  const ${componentName}({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xfff4f4f5),
+      body: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Wrap(
+            spacing: 24,
+            runSpacing: 24,
+            alignment: WrapAlignment.start,
+${indent(dart, 12)}
+          ),
+        ),
+      ),
+    );
+  }
+}`;
+}
+
+function renderFlutterNode(node: FigmaNode, parent: FigmaNode | undefined, key: string): string {
+  if (node.type === "TEXT") {
+    const textColor = getFlutterTextColor(node);
+    const fontSize = node.style?.fontSize ?? 14;
+    const fontWeight = getFlutterFontWeight(node.style?.fontWeight);
+    
+    return `Text(
+  '${escapeDart(node.characters ?? node.name)}',
+  style: TextStyle(
+    fontSize: ${fontSize},
+    fontWeight: ${fontWeight},
+    color: ${textColor},
+  ),
+)`;
+  }
+
+  const children = (node.children ?? [])
+    .filter(hasRenderableBox)
+    .map((child, index) => renderFlutterNode(child, node, `${key}_${index + 1}`))
+    .join(",\n");
+
+  const box = node.absoluteBoundingBox;
+  const width = box ? Math.round(box.width) : 100;
+  const height = box ? Math.round(box.height) : 100;
+  const bgColor = getFlutterColor(node.fills);
+  const borderRadius = node.cornerRadius ?? 0;
+
+  if (!children) {
+    return `Container(
+  width: ${width},
+  height: ${height},
+  decoration: BoxDecoration(
+    color: ${bgColor},
+    borderRadius: BorderRadius.circular(${borderRadius}),
+  ),
+)`;
+  }
+
+  return `Container(
+  width: ${width},
+  height: ${height},
+  decoration: BoxDecoration(
+    color: ${bgColor},
+    borderRadius: BorderRadius.circular(${borderRadius}),
+  ),
+  child: Column(
+    children: [
+${indent(children, 6)}
+    ],
+  ),
+)`;
+}
+
+function getFlutterColor(paints?: FigmaPaint[]): string {
+  const paint = paints?.find((item) => item.type === "SOLID" && item.color);
+  if (!paint?.color) return "Colors.white";
+
+  const alpha = (paint.color.a ?? 1) * (paint.opacity ?? 1);
+  const r = Math.round(paint.color.r * 255);
+  const g = Math.round(paint.color.g * 255);
+  const b = Math.round(paint.color.b * 255);
+  const a = Math.round(alpha * 255);
+
+  return `const Color(0x${a.toString(16).padStart(2, '0')}${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')})`;
+}
+
+function getFlutterTextColor(node: FigmaNode): string {
+  const color = firstSolidPaint(node.fills);
+  if (color) return getFlutterColorFromRgb(color);
+  return "Colors.black";
+}
+
+function getFlutterColorFromRgb(rgbString: string): string {
+  const match = rgbString.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
+  if (!match) return "Colors.black";
+
+  const r = parseInt(match[1]);
+  const g = parseInt(match[2]);
+  const b = parseInt(match[3]);
+  const a = match[4] ? Math.round(parseFloat(match[4]) * 255) : 255;
+
+  return `const Color(0x${a.toString(16).padStart(2, '0')}${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')})`;
+}
+
+function getFlutterFontWeight(fontWeight?: number): string {
+  if (!fontWeight) return "FontWeight.normal";
+  if (fontWeight >= 700) return "FontWeight.bold";
+  if (fontWeight >= 600) return "FontWeight.w600";
+  if (fontWeight >= 500) return "FontWeight.w500";
+  return "FontWeight.normal";
+}
+
+function escapeDart(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r");
 }
 
 function renderHtmlNode(
@@ -216,6 +425,14 @@ export function toStyleMap(node: FigmaNode, parent?: FigmaNode) {
   const background = firstSolidPaint(node.fills);
   if (background) styles.background = background;
 
+  const image = firstImagePaint(node.fills);
+  if (image?.src) {
+    styles.backgroundImage = `url("${image.src}")`;
+    styles.backgroundSize = "cover";
+    styles.backgroundPosition = "center";
+    styles.backgroundRepeat = "no-repeat";
+  }
+
   const border = firstSolidPaint(node.strokes);
   if (border) styles.border = `${node.strokeWeight ?? 1}px solid ${border}`;
 
@@ -250,6 +467,10 @@ export function firstSolidPaint(paints?: FigmaPaint[]) {
   const b = Math.round(paint.color.b * 255);
 
   return alpha >= 0.99 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${alpha.toFixed(3)})`;
+}
+
+export function firstImagePaint(paints?: FigmaPaint[]) {
+  return paints?.find((item) => item.type === "IMAGE" && item.src);
 }
 
 function toComponentName(value: string) {

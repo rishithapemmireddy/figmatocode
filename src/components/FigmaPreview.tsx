@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { FigmaNode, toStyleMap } from "../utils/figmaToCode";
+import { FigmaNode, getRenderablePageNode, toStyleMap } from "../utils/figmaToCode";
 
 interface FigmaNodePreviewProps {
   node: FigmaNode;
@@ -29,28 +29,27 @@ export function FigmaNodePreview({ node, parent }: FigmaNodePreviewProps) {
 }
 
 interface FigmaPreviewProps {
-  activeFrame: FigmaNode | null;
+  activePage: FigmaNode | null;
 }
 
-export function FigmaPreview({ activeFrame }: FigmaPreviewProps) {
+export function FigmaPreview({ activePage }: FigmaPreviewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
+  const renderablePage = activePage ? getRenderablePageNode(activePage) : null;
+  const pageBox = renderablePage?.absoluteBoundingBox ?? { width: 360, height: 640 };
 
   useEffect(() => {
-    if (!activeFrame || !containerRef.current) return;
+    if (!activePage || !containerRef.current) return;
 
     const updateScale = () => {
       const container = containerRef.current;
       if (!container) return;
 
-      const containerWidth = container.clientWidth - 32; // padding
-      const containerHeight = container.clientHeight - 32; // padding
-      const frameWidth = activeFrame.absoluteBoundingBox?.width || 360;
-      const frameHeight = activeFrame.absoluteBoundingBox?.height || 640;
-
-      const scaleX = containerWidth / frameWidth;
-      const scaleY = containerHeight / frameHeight;
-      const newScale = Math.min(scaleX, scaleY, 1); // don't scale up past 100%
+      const containerWidth = container.clientWidth - 32;
+      const containerHeight = container.clientHeight - 32;
+      const scaleX = containerWidth / pageBox.width;
+      const scaleY = containerHeight / pageBox.height;
+      const newScale = Math.min(scaleX, scaleY, 1);
 
       setScale(newScale > 0.1 ? newScale : 1);
     };
@@ -63,9 +62,9 @@ export function FigmaPreview({ activeFrame }: FigmaPreviewProps) {
     return () => {
       observer.disconnect();
     };
-  }, [activeFrame]);
+  }, [activePage, pageBox.width, pageBox.height]);
 
-  if (!activeFrame) {
+  if (!activePage) {
     return (
       <div className="flex h-full min-h-[300px] flex-col items-center justify-center rounded-lg border border-dashed border-[#e9c4d0] bg-[#fdfafb] p-6 text-center text-shield-plum/50">
         <svg
@@ -81,16 +80,13 @@ export function FigmaPreview({ activeFrame }: FigmaPreviewProps) {
             d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
           />
         </svg>
-        <span className="text-sm font-semibold">No Frame Selected</span>
+        <span className="text-sm font-semibold">No Page Selected</span>
         <span className="mt-1 text-xs text-shield-plum/40">
-          Load Figma JSON and select a frame from the sidebar to preview.
+          Load Figma JSON and select a page from the sidebar to preview.
         </span>
       </div>
     );
   }
-
-  const width = activeFrame.absoluteBoundingBox?.width || 360;
-  const height = activeFrame.absoluteBoundingBox?.height || 640;
 
   return (
     <div
@@ -100,17 +96,17 @@ export function FigmaPreview({ activeFrame }: FigmaPreviewProps) {
       <div
         className="relative shadow-phone transition-all border border-[#e9c4d0] bg-white rounded"
         style={{
-          width: `${width}px`,
-          height: `${height}px`,
+          width: `${pageBox.width}px`,
+          height: `${pageBox.height}px`,
           transform: `scale(${scale})`,
           transformOrigin: "center center",
-          transition: "transform 0.2s ease-out",
+          transition: "transform 0.2s ease-out"
         }}
       >
-        <FigmaNodePreview node={activeFrame} />
+        <FigmaNodePreview node={renderablePage} />
       </div>
       <div className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full bg-shield-plum/85 px-3 py-1 text-[10px] font-semibold tracking-wider text-white backdrop-blur">
-        {activeFrame.name} • {Math.round(width)}x{Math.round(height)} px • {Math.round(scale * 100)}%
+        {activePage.name} - {Math.round(pageBox.width)}x{Math.round(pageBox.height)} px - {Math.round(scale * 100)}%
       </div>
     </div>
   );
