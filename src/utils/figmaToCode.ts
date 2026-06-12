@@ -262,25 +262,36 @@ function renderFlutterNode(node: FigmaNode, parent: FigmaNode | undefined, key: 
   const height = box ? Math.round(box.height) : 100;
   const bgColor = getFlutterColor(node.fills);
   const borderRadius = node.cornerRadius ?? 0;
+  const imageUrl = getFlutterImageUrl(node.fills);
+  const borderStyle = getFlutterBorder(node);
+
+  let decoration = `BoxDecoration(
+    color: ${bgColor},
+    borderRadius: BorderRadius.circular(${borderRadius}),${borderStyle}`;
+
+  if (imageUrl) {
+    decoration += `,
+    image: DecorationImage(
+      image: NetworkImage('${imageUrl}'),
+      fit: BoxFit.cover,
+    )`;
+  }
+  
+  decoration += `
+  )`;
 
   if (!children) {
     return `Container(
   width: ${width},
   height: ${height},
-  decoration: BoxDecoration(
-    color: ${bgColor},
-    borderRadius: BorderRadius.circular(${borderRadius}),
-  ),
+  decoration: ${decoration},
 )`;
   }
 
   return `Container(
   width: ${width},
   height: ${height},
-  decoration: BoxDecoration(
-    color: ${bgColor},
-    borderRadius: BorderRadius.circular(${borderRadius}),
-  ),
+  decoration: ${decoration},
   child: Column(
     children: [
 ${indent(children, 6)}
@@ -300,6 +311,22 @@ function getFlutterColor(paints?: FigmaPaint[]): string {
   const a = Math.round(alpha * 255);
 
   return `const Color(0x${a.toString(16).padStart(2, '0')}${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')})`;
+}
+
+function getFlutterImageUrl(paints?: FigmaPaint[]): string {
+  const image = firstImagePaint(paints);
+  return image?.src ?? "";
+}
+
+function getFlutterBorder(node: FigmaNode): string {
+  const stroke = firstSolidPaint(node.strokes);
+  if (!stroke) return "";
+  const weight = node.strokeWeight ?? 1;
+  return `,
+    border: Border.all(
+      color: ${getFlutterColorFromRgb(stroke)},
+      width: ${weight},
+    )`;
 }
 
 function getFlutterTextColor(node: FigmaNode): string {

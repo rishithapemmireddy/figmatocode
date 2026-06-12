@@ -152,8 +152,12 @@ function replaceImageRefsWithSrc<T>(value: T, refToPath: Map<string, string>): T
 
   const output: Record<string, unknown> = {};
   for (const [key, childValue] of Object.entries(value)) {
-    if (key === "imageRef" && typeof childValue === "string" && refToPath.has(childValue)) {
-      output.src = refToPath.get(childValue);
+    if (key === "imageRef" && typeof childValue === "string") {
+      // Always replace imageRef with src if we have a path, or skip imageRef entirely
+      if (refToPath.has(childValue)) {
+        output.src = refToPath.get(childValue);
+      }
+      // Skip adding imageRef to output - we only want src
       continue;
     }
 

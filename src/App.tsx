@@ -236,11 +236,11 @@ export function App() {
     const cleanToken = figmaToken.trim();
 
     if (!cleanKey || !cleanToken) {
-      setImageAssetMessage("Image extraction skipped: enter Figma file key and token in Step 1.");
+      setImageAssetMessage("Image extraction skipped: No Figma token/key provided.");
       return parsed;
     }
 
-    setImageAssetMessage("Checking Figma image fills...");
+    setImageAssetMessage("Extracting images from Figma...");
 
     try {
       const response = await fetch("/figma-assets/extract", {
@@ -257,8 +257,16 @@ export function App() {
 
       const data = (await response.json()) as AssetExtractionResponse;
 
-      if (!response.ok || !data.figmaJson) {
-        throw new Error(data.error || `Image extraction failed: ${response.status}`);
+      if (!response.ok) {
+        const errorMsg = data.error || `Image extraction failed: ${response.status}`;
+        setImageAssetMessage(`Error: ${errorMsg}`);
+        console.error("Image extraction error:", errorMsg);
+        return parsed;
+      }
+
+      if (!data.figmaJson) {
+        setImageAssetMessage("Error: Invalid response from image extraction.");
+        return parsed;
       }
 
       const count = data.assets?.length ?? 0;
@@ -266,22 +274,28 @@ export function App() {
       const missingCount = data.missingRefs?.length ?? 0;
 
       if (count > 0) {
-        setImageAssetMessage(`Downloaded ${count}/${imageRefCount} Figma image asset${count === 1 ? "" : "s"}.`);
+        setImageAssetMessage(
+          `✓ Downloaded ${count}/${imageRefCount} image${count === 1 ? "" : "s"} from Figma. Ready for rendering!`
+        );
       } else if (imageRefCount > 0) {
         setImageAssetMessage(
-          `Found ${imageRefCount} image refs, but Figma returned no downloadable URLs. Check that Step 1 uses the same file key and a token with access, and that Figma is not rate-limited.`
+          `⚠ Found ${imageRefCount} image refs but could not download. Check Figma token access and rate limits.`
         );
       } else {
-        setImageAssetMessage("No Figma image fills found.");
+        setImageAssetMessage("✓ No images found in this design.");
       }
 
       if (missingCount > 0 && count > 0) {
-        setImageAssetMessage(`Downloaded ${count}/${imageRefCount} Figma image assets. ${missingCount} refs had no downloadable URL.`);
+        setImageAssetMessage(
+          `✓ Downloaded ${count}/${imageRefCount} images. (${missingCount} refs had no downloadable URL)`
+        );
       }
 
       return data.figmaJson;
     } catch (error) {
-      setImageAssetMessage(error instanceof Error ? error.message : "Unable to extract image assets.");
+      const msg = error instanceof Error ? error.message : "Unable to extract image assets.";
+      setImageAssetMessage(`Error: ${msg}`);
+      console.error("Image extraction exception:", error);
       return parsed;
     }
   }
